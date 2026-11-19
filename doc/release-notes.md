@@ -1,5 +1,9 @@
 # Release Notes
 
+## Unreleased
+
+- `Model.add_piecewise_formulation` accepts a row scaling factor per expression, so power and cost rows can be scaled in their own units.
+
 ## Version 1.0.0
 
 linopy 1.0 makes the strict arithmetic convention the only behaviour and puts dense and sparse models on one storage layer. It adds rolling-horizon windows, long-form inputs and model building from mathspec programs. Read **Breaking changes** before upgrading.

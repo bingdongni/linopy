@@ -33,6 +33,7 @@ from linopy.constants import (
     PWL_DOMAIN_LO_SUFFIX,
     PWL_FILL_ORDER_SUFFIX,
     PWL_LAMBDA_SUFFIX,
+    PWL_LINK_DIM,
     PWL_LINK_SUFFIX,
     PWL_ORDER_BINARY_SUFFIX,
     PWL_OUTPUT_LINK_SUFFIX,
@@ -2802,6 +2803,8 @@ class TestLPEligibilityReasons:
 
         if sign == EQUAL:
             return _PwlInputs(
+                pinned_scaling=[1.0] * len(pinned_exprs),
+                bounded_scaling=1.0,
                 pinned_exprs=pinned_exprs,
                 pinned_bps=pinned_bps,
                 pinned_coords=pinned_coords,
@@ -2814,6 +2817,8 @@ class TestLPEligibilityReasons:
 
         y = m.add_variables(name=f"y_{id(y_pts)}")
         return _PwlInputs(
+            pinned_scaling=[1.0] * len(pinned_exprs),
+            bounded_scaling=1.0,
             pinned_exprs=pinned_exprs,
             pinned_bps=pinned_bps,
             pinned_coords=pinned_coords,
@@ -3250,3 +3255,65 @@ class TestFullyMaskedEntity:
         m.add_objective(-x.sum())
         m.solve("highs", reformulate_sos=True)
         np.testing.assert_allclose(m.solution["x"].values, [10, 10])
+
+
+@pytest.mark.parametrize("method", ["incremental", "sos2"])
+def test_piecewise_link_row_scaling(method):
+    m = Model()
+    x = m.add_variables(name="x")
+    y = m.add_variables(name="y")
+    z = m.add_variables(name="z")
+    pwl = m.add_piecewise_formulation(
+        (x, [0, 20, 40]),
+        (y, [5, 10, 25]),
+        (z, [0, 3, 8]),
+        name="curve",
+        method=method,
+        scaling=(0.1, 0.01, 0.001),
+    )
+    expected = xr.DataArray([0.1, 0.01, 0.001], coords={PWL_LINK_DIM: ["x", "y", "z"]})
+    xr.testing.assert_allclose(m.constraints["curve_link"].scaling, expected)
+    for name in set(pwl.constraint_names) - {"curve_link"}:
+        assert (m.constraints[name].scaling == 1).all()
+
+
+def test_signed_piecewise_link_row_scaling():
+    m = Model()
+    x, y = m.add_variables(name="x"), m.add_variables(name="y")
+    m.add_piecewise_formulation(
+        (y, [0, 100, 300], ">="),
+        (x, [0, 10, 20]),
+        method="incremental",
+        name="curve",
+        scaling=(0.01, 0.1),
+    )
+    assert m.constraints["curve_link"].scaling.item() == 0.1
+    assert m.constraints["curve_output_link"].scaling.item() == 0.01
+
+
+@pytest.mark.parametrize("factors", [0.25, (0.01, 0.001)])
+def test_piecewise_lp_row_scaling(factors):
+    m = Model()
+    x = m.add_variables(name="power")
+    y = m.add_variables(name="cost")
+    m.add_piecewise_formulation(
+        (y, [0, 100, 300], ">="),
+        (x, [0, 10, 20]),
+        name="curve",
+        method="lp",
+        scaling=factors,
+    )
+    y_scale, x_scale = (factors, factors) if np.isscalar(factors) else factors
+    assert (m.constraints["curve_chord"].scaling == y_scale).all()
+    for name in ["curve_domain_lo", "curve_domain_hi"]:
+        assert m.constraints[name].scaling.item() == x_scale
+
+
+@pytest.mark.parametrize("factors", [[1, 2, 3], [1, np.nan], [1, -1]])
+def test_invalid_piecewise_scaling_is_atomic(factors):
+    m = Model()
+    x, y = m.add_variables(name="x"), m.add_variables(name="y")
+    with pytest.raises(ValueError, match="scaling"):
+        m.add_piecewise_formulation((x, [0, 1]), (y, [0, 2]), scaling=factors)
+    assert list(m.variables) == ["x", "y"]
+    assert len(m.constraints) == 0

@@ -49,6 +49,7 @@ from linopy.constants import (
     _warn_evolving_api,
     sign_replace_dict,
 )
+from linopy.scaling import validate_scaling
 from linopy.semantics import check_user_nan_breakpoints, warn_outside_linopy
 
 if TYPE_CHECKING:
@@ -1069,6 +1070,7 @@ def add_piecewise_formulation(
     active_fill: int | None = None,
     mask: MaskLike | None = None,
     name: str | None = None,
+    scaling: float | Sequence[float] = 1,
 ) -> PiecewiseFormulation:
     r"""
     Add piecewise linear constraints.
@@ -1191,6 +1193,13 @@ def add_piecewise_formulation(
         breakpoint; a NaN at a slot the mask calls present raises.
     name : str, optional
         Base name for generated variables/constraints.
+    scaling : float or sequence of float, default 1
+        Positive row scaling for each expression, in the same order as the
+        positional pairs. A scalar applies to all pairs. For example,
+        ``scaling=(1e-3, 1e-6)`` scales power and cost rows independently.
+        LP domain bounds use the input factor and chords use the output
+        factor. Constraints on interpolation weights and binaries have unit
+        scaling.
 
     Returns
     -------
@@ -1352,7 +1361,15 @@ def add_piecewise_formulation(
     else:
         active_expr = _resolve_active(_to_linexpr(active), bp_list[0], active_fill)
 
+    factors = validate_scaling(np.asarray(scaling), "piecewise scaling")
+    if factors.ndim == 0:
+        factors = np.full(len(pairs), factors.item())
+    elif factors.shape != (len(pairs),):
+        raise ValueError("scaling must be a scalar or have one factor per pair.")
+
     inputs = _PwlInputs(
+        pinned_scaling=[float(f) for j, f in enumerate(factors) if j != signed_idx],
+        bounded_scaling=1.0 if signed_idx is None else float(factors[signed_idx]),
         pinned_exprs=[e for j, e in enumerate(lin_exprs) if j != signed_idx],
         pinned_bps=[b for j, b in enumerate(bp_list) if j != signed_idx],
         pinned_coords=[c for j, c in enumerate(link_coords) if j != signed_idx],
@@ -1438,6 +1455,8 @@ class _PwlInputs:
     ``bounded_sign`` is ``EQUAL`` iff ``bounded_expr is None``.
     """
 
+    pinned_scaling: list[float]
+    bounded_scaling: float
     pinned_exprs: list[LinearExpression]
     pinned_bps: list[DataArray]
     pinned_coords: list[str]
@@ -1507,6 +1526,8 @@ class _PwlLinks:
     stacked_bp: DataArray
     bp_mask: DataArray | None
     sign: str
+    eq_scaling: DataArray | float
+    signed_scaling: float
     eq_expr: LinearExpression | None
     eq_bp: DataArray | None
     signed_expr: LinearExpression | None
@@ -1535,6 +1556,14 @@ def _build_links(model: Model, inputs: _PwlInputs) -> _PwlLinks:
         eq_bp = _stack_along_link(inputs.pinned_bps, inputs.pinned_coords)
 
     return _PwlLinks(
+        eq_scaling=(
+            DataArray(
+                inputs.pinned_scaling, coords={PWL_LINK_DIM: inputs.pinned_coords}
+            )
+            if len(set(inputs.pinned_scaling)) > 1
+            else next(iter(inputs.pinned_scaling), 1.0)
+        ),
+        signed_scaling=inputs.bounded_scaling,
         stacked_bp=_stack_along_link(inputs.all_bps(), inputs.all_coords()),
         bp_mask=inputs.bp_mask,
         sign=inputs.bounded_sign,
@@ -1582,6 +1611,8 @@ def _try_lp(
         inputs.pinned_bps[0],
         inputs.bounded_bp,
         inputs.bounded_sign,
+        inputs.pinned_scaling[0],
+        inputs.bounded_scaling,
     )
     return True
 
@@ -1651,10 +1682,16 @@ def _add_links(
 ) -> None:
     """Link the equality side and the (optional) signed side to ``weighted``."""
     sides = [
-        (links.eq_expr, links.eq_bp, EQUAL, PWL_LINK_SUFFIX),
-        (links.signed_expr, links.signed_bp, links.sign, PWL_OUTPUT_LINK_SUFFIX),
+        (links.eq_expr, links.eq_bp, EQUAL, PWL_LINK_SUFFIX, links.eq_scaling),
+        (
+            links.signed_expr,
+            links.signed_bp,
+            links.sign,
+            PWL_OUTPUT_LINK_SUFFIX,
+            links.signed_scaling,
+        ),
     ]
-    for expr, bp, sign, suffix in sides:
+    for expr, bp, sign, suffix, scaling in sides:
         if expr is not None and bp is not None:
             _add_signed_link(
                 model,
@@ -1663,6 +1700,7 @@ def _add_links(
                 sign,
                 f"{name}{suffix}",
                 mask=links.entity_mask,
+                scaling=scaling,
             )
 
 
@@ -1838,14 +1876,15 @@ def _add_signed_link(
     sign: str,
     name: str,
     mask: DataArray | None = None,
+    scaling: DataArray | float = 1,
 ) -> Constraint:
     """Add a link constraint with the requested sign."""
     if sign == EQUAL:
-        return model.add_constraints(lhs == rhs, name=name, mask=mask)
+        return model.add_constraints(lhs == rhs, name=name, mask=mask, scaling=scaling)
     elif sign == LESS_EQUAL:
-        return model.add_constraints(lhs <= rhs, name=name, mask=mask)
+        return model.add_constraints(lhs <= rhs, name=name, mask=mask, scaling=scaling)
     else:  # ">="
-        return model.add_constraints(lhs >= rhs, name=name, mask=mask)
+        return model.add_constraints(lhs >= rhs, name=name, mask=mask, scaling=scaling)
 
 
 def _add_lp(
@@ -1856,6 +1895,8 @@ def _add_lp(
     x_points: DataArray,
     y_points: DataArray,
     sign: str,
+    x_scaling: float,
+    y_scaling: float,
 ) -> None:
     """
     LP tangent-line formulation (no auxiliary variables).
@@ -1885,11 +1926,16 @@ def _add_lp(
         sign,
         f"{name}{PWL_CHORD_SUFFIX}",
         mask=piece_mask,
+        scaling=y_scaling,
     )
 
     # Domain bounds: x ∈ [x_min, x_max] over paired-valid breakpoints.
     paired_x_points = x_points.where(bp_valid)
     x_min = paired_x_points.min(dim=BREAKPOINT_DIM)
     x_max = paired_x_points.max(dim=BREAKPOINT_DIM)
-    model.add_constraints(x_expr >= x_min, name=f"{name}{PWL_DOMAIN_LO_SUFFIX}")
-    model.add_constraints(x_expr <= x_max, name=f"{name}{PWL_DOMAIN_HI_SUFFIX}")
+    model.add_constraints(
+        x_expr >= x_min, name=f"{name}{PWL_DOMAIN_LO_SUFFIX}", scaling=x_scaling
+    )
+    model.add_constraints(
+        x_expr <= x_max, name=f"{name}{PWL_DOMAIN_HI_SUFFIX}", scaling=x_scaling
+    )
